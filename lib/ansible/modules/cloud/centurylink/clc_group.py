@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# -*- coding: utf-8 -*-
 
 #
 # Copyright (c) 2015 CenturyLink
@@ -60,8 +61,6 @@ options:
     required: False
 requirements:
     - python = 2.7
-    - requests >= 2.5.0
-    - clc-sdk
 author: "CLC Runner (@clc-runner)"
 notes:
     - To use this module, it is required to set the below environment variables which enables access to the
@@ -87,14 +86,13 @@ EXAMPLES = '''
   tasks:
     - name: Create / Verify a Server Group at CenturyLink Cloud
       clc_group:
-        name: My Cool Server Group
-        parent: Default Group
+        name: 'My Cool Server Group'
+        parent: 'Default Group'
         state: present
       register: clc
 
     - name: debug
-      debug:
-        var: clc
+      debug: var=clc
 
 # Delete a Server Group
 
@@ -106,17 +104,22 @@ EXAMPLES = '''
   tasks:
     - name: Delete / Verify Absent a Server Group at CenturyLink Cloud
       clc_group:
-        name: My Cool Server Group
-        parent: Default Group
+        name: 'My Cool Server Group'
+        parent: 'Default Group'
         state: absent
       register: clc
 
     - name: debug
-      debug:
-        var: clc
+      debug: var=clc
+
 '''
 
 RETURN = '''
+changed:
+    description: A flag indicating if any change was made or not
+    returned: success
+    type: boolean
+    sample: True
 group:
     description: The group information
     returned: success
@@ -217,56 +220,18 @@ group:
 
 __version__ = '${version}'
 
-import os
-from distutils.version import LooseVersion
-
-try:
-    import requests
-except ImportError:
-    REQUESTS_FOUND = False
-else:
-    REQUESTS_FOUND = True
-
-#
-#  Requires the clc-python-sdk.
-#  sudo pip install clc-sdk
-#
-try:
-    import clc as clc_sdk
-    from clc import CLCException
-except ImportError:
-    CLC_FOUND = False
-    clc_sdk = None
-else:
-    CLC_FOUND = True
-
-from ansible.module_utils.basic import AnsibleModule
-
 
 class ClcGroup(object):
 
-    clc = None
     root_group = None
 
     def __init__(self, module):
         """
         Construct module
         """
-        self.clc = clc_sdk
+        self.clc_auth = {}
         self.module = module
-        self.group_dict = {}
-
-        if not CLC_FOUND:
-            self.module.fail_json(
-                msg='clc-python-sdk required for this module')
-        if not REQUESTS_FOUND:
-            self.module.fail_json(
-                msg='requests library is required for this module')
-        if requests.__version__ and LooseVersion(requests.__version__) < LooseVersion('2.5.0'):
-            self.module.fail_json(
-                msg='requests library  version should be >= 2.5.0')
-
-        self._set_user_agent(self.clc)
+        self.root_group = None
 
     def process_request(self):
         """
@@ -279,18 +244,20 @@ class ClcGroup(object):
         group_description = self.module.params.get('description')
         state = self.module.params.get('state')
 
-        self._set_clc_credentials_from_env()
-        self.group_dict = self._get_group_tree_for_datacenter(
-            datacenter=location)
+        # TODO: Initialize credentials from non-private method
+        self.clc_auth = clc_common.authenticate(self.module)
+        self.root_group = clc_common.group_tree(self.module, self.clc_auth,
+                                                datacenter=location)
 
         if state == "absent":
-            changed, group, requests = self._ensure_group_is_absent(
+            changed, group, requests_lst = self._ensure_group_is_absent(
                 group_name=group_name, parent_name=parent_name)
-            if requests:
-                self._wait_for_requests_to_complete(requests)
+            if requests_lst:
+                self._wait_for_requests_to_complete(requests_lst)
         else:
             changed, group = self._ensure_group_is_present(
-                group_name=group_name, parent_name=parent_name, group_description=group_description)
+                group_name=group_name, parent_name=parent_name,
+                group_description=group_description)
         try:
             group = group.data
         except AttributeError:
@@ -313,34 +280,6 @@ class ClcGroup(object):
 
         return argument_spec
 
-    def _set_clc_credentials_from_env(self):
-        """
-        Set the CLC Credentials on the sdk by reading environment variables
-        :return: none
-        """
-        env = os.environ
-        v2_api_token = env.get('CLC_V2_API_TOKEN', False)
-        v2_api_username = env.get('CLC_V2_API_USERNAME', False)
-        v2_api_passwd = env.get('CLC_V2_API_PASSWD', False)
-        clc_alias = env.get('CLC_ACCT_ALIAS', False)
-        api_url = env.get('CLC_V2_API_URL', False)
-
-        if api_url:
-            self.clc.defaults.ENDPOINT_URL_V2 = api_url
-
-        if v2_api_token and clc_alias:
-            self.clc._LOGIN_TOKEN_V2 = v2_api_token
-            self.clc._V2_ENABLED = True
-            self.clc.ALIAS = clc_alias
-        elif v2_api_username and v2_api_passwd:
-            self.clc.v2.SetCredentials(
-                api_username=v2_api_username,
-                api_passwd=v2_api_passwd)
-        else:
-            return self.module.fail_json(
-                msg="You must set the CLC_V2_API_USERNAME and CLC_V2_API_PASSWD "
-                    "environment variables")
-
     def _ensure_group_is_absent(self, group_name, parent_name):
         """
         Ensure that group_name is absent by deleting it if necessary
@@ -352,28 +291,36 @@ class ClcGroup(object):
         group = []
         results = []
 
+        if parent_name is None:
+            parent_name = self.root_group.name
         if self._group_exists(group_name=group_name, parent_name=parent_name):
             if not self.module.check_mode:
                 group.append(group_name)
-                result = self._delete_group(group_name)
+                result = self._delete_group(group_name, parent_name)
                 results.append(result)
             changed = True
         return changed, group, results
 
-    def _delete_group(self, group_name):
+    def _delete_group(self, group_name, parent_name):
         """
         Delete the provided server group
         :param group_name: string - the server group to delete
         :return: none
         """
         response = None
-        group, parent = self.group_dict.get(group_name)
+        if parent_name is None:
+            parent_name = self.root_group.name
+        group = clc_common.find_group(self.module, self.root_group,
+                                      group_name, parent_info=parent_name)
         try:
-            response = group.Delete()
-        except CLCException as ex:
-            self.module.fail_json(msg='Failed to delete group :{0}. {1}'.format(
-                group_name, ex.response_text
-            ))
+            response = clc_common.call_clc_api(
+                self.module, self.clc_auth,
+                'DELETE', '/groups/{alias}/{id}'.format(
+                    alias=self.clc_auth['clc_alias'], id=group.id))
+        except ClcApiException as ex:
+            self.module.fail_json(
+                msg='Failed to delete group :{name}. {msg}'.format(
+                    name=group_name, msg=ex.message))
         return response
 
     def _ensure_group_is_present(
@@ -391,50 +338,63 @@ class ClcGroup(object):
             group:  A clc group object for the group
         """
         assert self.root_group, "Implementation Error: Root Group not set"
-        parent = parent_name if parent_name is not None else self.root_group.name
+        if parent_name is None:
+            parent_name = self.root_group.name
         description = group_description
-        changed = False
         group = group_name
+        changed = False
 
-        parent_exists = self._group_exists(group_name=parent, parent_name=None)
-        child_exists = self._group_exists(
-            group_name=group_name,
-            parent_name=parent)
+        parent_exists = self._group_exists(group_name=parent_name,
+                                           parent_name=None)
+        child_exists = self._group_exists(group_name=group_name,
+                                          parent_name=parent_name)
 
         if parent_exists and child_exists:
-            group, parent = self.group_dict[group_name]
+            group = clc_common.find_group(self.module, self.root_group,
+                                          group_name, parent_info=parent_name)
             changed = False
         elif parent_exists and not child_exists:
             if not self.module.check_mode:
+                # TODO: Update self.root_group with new information
                 group = self._create_group(
-                    group=group,
-                    parent=parent,
+                    group_name=group_name,
+                    parent_name=parent_name,
                     description=description)
             changed = True
         else:
             self.module.fail_json(
-                msg="parent group: " +
-                parent +
-                " does not exist")
+                msg='parent group: \"{name}\" does not exist'.format(
+                    name=parent_name))
 
         return changed, group
 
-    def _create_group(self, group, parent, description):
+    def _create_group(self, group_name, parent_name, description):
         """
         Create the provided server group
-        :param group: clc_sdk.Group - the group to create
-        :param parent: clc_sdk.Parent - the parent group for {group}
-        :param description: string - a text description of the group
-        :return: clc_sdk.Group - the created group
+        :param group: The group to create
+        :param parent: The parent group for {group}
+        :param description: a text description of the group
+        :return: The created group
         """
-        response = None
-        (parent, grandparent) = self.group_dict[parent]
+        group = None
+        parent = clc_common.find_group(self.module, self.root_group,
+                                       parent_name)
+        if not description:
+            description = group_name
+        # TODO: Check for proper HTTP response code
         try:
-            response = parent.Create(name=group, description=description)
-        except CLCException as ex:
-            self.module.fail_json(msg='Failed to create group :{0}. {1}'.format(
-                group, ex.response_text))
-        return response
+            group_data = clc_common.call_clc_api(
+                self.module, self.clc_auth,
+                'POST', '/groups/{alias}'.format(
+                    alias=self.clc_auth['clc_alias']),
+                data={'name': group_name, 'description': description,
+                      'parentGroupId': parent.id})
+            group = clc_common.Group(group_data)
+        except ClcApiException as ex:
+            self.module.fail_json(
+                msg='Failed to create group :{name}. {msg}'.format(
+                    name=group_name, msg=ex.message))
+        return group
 
     def _group_exists(self, group_name, parent_name):
         """
@@ -444,64 +404,30 @@ class ClcGroup(object):
         :return: boolean - whether the group exists
         """
         result = False
-        if group_name in self.group_dict:
-            (group, parent) = self.group_dict[group_name]
-            if parent_name is None or parent_name == parent.name:
-                result = True
+        if parent_name:
+            group = clc_common.find_group(self.module, self.root_group,
+                                          group_name, parent_info=parent_name)
+        else:
+            group = clc_common.find_group(self.module, self.root_group,
+                                          group_name)
+        if group:
+            result = True
         return result
 
-    def _get_group_tree_for_datacenter(self, datacenter=None):
+    def _wait_for_requests_to_complete(self, request_list):
         """
-        Walk the tree of groups for a datacenter
-        :param datacenter: string - the datacenter to walk (ex: 'UC1')
-        :return: a dictionary of groups and parents
-        """
-        self.root_group = self.clc.v2.Datacenter(
-            location=datacenter).RootGroup()
-        return self._walk_groups_recursive(
-            parent_group=None,
-            child_group=self.root_group)
-
-    def _walk_groups_recursive(self, parent_group, child_group):
-        """
-        Walk a parent-child tree of groups, starting with the provided child group
-        :param parent_group: clc_sdk.Group - the parent group to start the walk
-        :param child_group: clc_sdk.Group - the child group to start the walk
-        :return: a dictionary of groups and parents
-        """
-        result = {str(child_group): (child_group, parent_group)}
-        groups = child_group.Subgroups().groups
-        if len(groups) > 0:
-            for group in groups:
-                if group.type != 'default':
-                    continue
-
-                result.update(self._walk_groups_recursive(child_group, group))
-        return result
-
-    def _wait_for_requests_to_complete(self, requests_lst):
-        """
-        Waits until the CLC requests are complete if the wait argument is True
-        :param requests_lst: The list of CLC request objects
+        Block until group provisioning requests are completed.
+        :param request_list: a list of CLC API JSON responses
         :return: none
         """
-        if not self.module.params['wait']:
-            return
-        for request in requests_lst:
-            request.WaitUntilComplete()
-            for request_details in request.requests:
-                if request_details.Status() != 'succeeded':
-                    self.module.fail_json(
-                        msg='Unable to process group request')
-
-    @staticmethod
-    def _set_user_agent(clc):
-        if hasattr(clc, 'SetRequestsSession'):
-            agent_string = "ClcAnsibleModule/" + __version__
-            ses = requests.Session()
-            ses.headers.update({"Api-Client": agent_string})
-            ses.headers['User-Agent'] += " " + agent_string
-            clc.SetRequestsSession(ses)
+        wait = self.module.params.get('wait')
+        if wait:
+            failed_requests_count = clc_common.wait_on_completed_operations(
+                self.module, self.clc_auth,
+                clc_common.operation_id_list(request_list))
+            if failed_requests_count > 0:
+                self.module.fail_json(
+                    msg='Unable to process group request')
 
 
 def main():
@@ -516,6 +442,9 @@ def main():
     clc_group = ClcGroup(module)
     clc_group.process_request()
 
-
+from ansible.module_utils.basic import *  # pylint: disable=W0614
+from ansible.module_utils.urls import *  # pylint: disable=W0614
+import ansible.module_utils.clc as clc_common  # pylint: disable=W0614
+from ansible.module_utils.clc import ClcApiException  # pylint: disable=W0614
 if __name__ == '__main__':
     main()
